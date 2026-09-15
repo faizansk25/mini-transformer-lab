@@ -1,0 +1,12 @@
+{
+  "vocab_size": 1024,
+  "d_model": 512,
+  "num_heads": 8,
+  "num_kv_heads": 4,
+  "num_layers": 8,
+  "d_ff": 1536,
+  "max_seq_len": 1024,
+  "dropout": 0.1,
+  "use_rope": true,
+  "use_rmsnorm": true
+}

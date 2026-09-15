@@ -1,37 +1,44 @@
-"""Visualize attention patterns from a trained transformer."""
+"""Save attention maps from a trained checkpoint."""
 
-import torch
+from __future__ import annotations
+
 import argparse
-from core.config import TransformerConfig
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import torch
+
+from core.tokenizer import BPETokenizer
 from core.transformer import MiniTransformer
 
 
-def visualize_attention(model, input_text: str):
-    tokens = [ord(c) % 256 for c in input_text]
-    x = torch.tensor([tokens], dtype=torch.long)
-    emb = model.token_emb(x)
-    for i, block in enumerate(model.blocks):
-        attn_weights = block.attn.get_attention_weights(emb)
-        print(f"\n--- Layer {i+1} Attention Shape: {attn_weights.shape} ---")
-        head0 = attn_weights[0, 0].detach().numpy()
-        for row in head0[:min(10, len(tokens))]:
-            line = "".join(["#" if v > 0.05 else "." for v in row[:min(20, len(tokens))]])
-            print(line)
+def save_attention_maps(model: MiniTransformer, token_ids: torch.Tensor, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hidden = model.token_emb(token_ids)
+    for index, block in enumerate(model.blocks):
+        weights = block.attn.get_attention_weights(block.norm1(hidden))[0].detach().cpu()
+        hidden, _ = block(hidden)
+        figure, axes = plt.subplots(1, min(4, weights.size(0)), squeeze=False)
+        for head, axis in enumerate(axes[0]):
+            axis.imshow(weights[head].numpy(), cmap="viridis", aspect="auto")
+            axis.set_title(f"head {head}")
+        figure.tight_layout()
+        figure.savefig(output_dir / f"layer_{index + 1}.png", dpi=160)
+        plt.close(figure)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, default="Hello world")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/mini_transformer.pt")
+    parser.add_argument("--input", default="Transformers are")
+    parser.add_argument("--checkpoint", default="checkpoints/mini_transformer.pt")
+    parser.add_argument("--output-dir", default="attention_maps")
     args = parser.parse_args()
-    config = TransformerConfig()
-    model = MiniTransformer(config)
-    try:
-        model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
-    except FileNotFoundError:
-        print("No checkpoint found. Using random weights.")
+    checkpoint = Path(args.checkpoint)
+    model = MiniTransformer.load_checkpoint(checkpoint)
+    tokenizer = BPETokenizer.load(checkpoint.with_suffix(".tokenizer.json"))
     model.eval()
-    visualize_attention(model, args.input)
+    ids = torch.tensor([tokenizer.encode(args.input)], dtype=torch.long)
+    save_attention_maps(model, ids, Path(args.output_dir))
 
 
 if __name__ == "__main__":

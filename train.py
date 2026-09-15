@@ -1,58 +1,104 @@
-"""Train a mini transformer language model."""
+"""Train Mini Transformer Lab on UTF-8 text."""
 
-import json
+from __future__ import annotations
+
 import argparse
+import random
 from pathlib import Path
-from torch.utils.data import DataLoader, Dataset
+from typing import Sequence, Tuple
+
 import torch
+from torch.utils.data import DataLoader, Dataset
+
 from core.config import TransformerConfig
+from core.tokenizer import BPETokenizer
 from core.transformer import MiniTransformer
 
-
-class TextDataset(Dataset):
-    def __init__(self, text: str, seq_len: int = 128):
-        tokens = [ord(c) % 256 for c in text]
-        self.sequences = []
-        for i in range(0, len(tokens) - seq_len, seq_len):
-            self.sequences.append(torch.tensor(tokens[i:i+seq_len+1], dtype=torch.long))
-        if not self.sequences:
-            self.sequences.append(torch.zeros(seq_len + 1, dtype=torch.long))
-    def __len__(self):
-        return len(self.sequences)
-    def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        return seq[:-1], seq[1:]
+DEFAULT_TEXT = (
+    "The transformer architecture learns patterns by predicting the next token. "
+    "Small controlled experiments make model behavior easier to understand. "
+) * 200
 
 
-def train(config_path: str = "configs/tiny.json", epochs: int = 5):
-    config = TransformerConfig.from_json(config_path) if Path(config_path).exists() else TransformerConfig()
-    model = MiniTransformer(config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    sample_text = "The transformer architecture has revolutionized natural language processing. " * 100
-    dataset = TextDataset(sample_text, config.max_seq_len)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+class TokenDataset(Dataset):
+    """Create fixed-length next-token training windows."""
+
+    def __init__(self, tokens: Sequence[int], seq_len: int, stride: int | None = None):
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive")
+        stride = stride or seq_len
+        self.samples = [
+            torch.tensor(tokens[start : start + seq_len + 1], dtype=torch.long)
+            for start in range(0, max(0, len(tokens) - seq_len), stride)
+            if len(tokens[start : start + seq_len + 1]) == seq_len + 1
+        ]
+        if not self.samples:
+            raise ValueError("training text is too short for the configured sequence length")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        sample = self.samples[index]
+        return sample[:-1], sample[1:]
+
+
+def train(
+    config_path: str = "configs/tiny.json",
+    text_path: str | None = None,
+    epochs: int = 5,
+    batch_size: int = 8,
+    learning_rate: float = 3e-4,
+    output_path: str = "checkpoints/mini_transformer.pt",
+    seed: int = 42,
+) -> MiniTransformer:
+    if epochs <= 0 or batch_size <= 0 or learning_rate <= 0:
+        raise ValueError("epochs, batch_size, and learning_rate must be positive")
+    random.seed(seed)
+    torch.manual_seed(seed)
+    config = TransformerConfig.from_json(config_path)
+    text = Path(text_path).read_text(encoding="utf-8") if text_path else DEFAULT_TEXT
+    tokenizer = BPETokenizer.train([text], target_vocab_size=config.vocab_size)
+    if tokenizer.vocab_size != config.vocab_size:
+        raise ValueError(
+            f"text produced {tokenizer.vocab_size} tokens, but config requires {config.vocab_size}; "
+            "use more training text or a smaller vocab_size"
+        )
+
+    dataset = TokenDataset(tokenizer.encode(text), config.max_seq_len)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MiniTransformer(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    print(f"device={device} parameters={sum(p.numel() for p in model.parameters()):,}")
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        for batch_idx, (x, y) in enumerate(dataloader):
-            _, loss = model(x, targets=y)
-            optimizer.zero_grad()
-            loss.backward()
+        losses = []
+        for inputs, targets in dataloader:
+            output = model(inputs.to(device), targets=targets.to(device))
+            assert output.loss is not None
+            optimizer.zero_grad(set_to_none=True)
+            output.loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item()
-            if batch_idx % 10 == 0:
-                print(f"  Epoch {epoch+1} Batch {batch_idx} Loss: {loss.item():.4f}")
-        print(f"Epoch {epoch+1}/{epochs} Avg Loss: {total_loss/max(len(dataloader),1):.4f}")
-    Path("checkpoints").mkdir(exist_ok=True)
-    torch.save(model.state_dict(), "checkpoints/mini_transformer.pt")
-    print("Model saved to checkpoints/mini_transformer.pt")
+            losses.append(output.loss.item())
+        print(f"epoch={epoch + 1}/{epochs} loss={sum(losses) / len(losses):.4f}")
+
+    model = model.cpu()
+    model.save_checkpoint(output_path)
+    tokenizer.save(Path(output_path).with_suffix(".tokenizer.json"))
     return model
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/tiny.json")
+    parser.add_argument("--text")
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--output", default="checkpoints/mini_transformer.pt")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    train(args.config, args.epochs)
+    train(args.config, args.text, args.epochs, args.batch_size, args.learning_rate, args.output, args.seed)
